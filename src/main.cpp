@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <SPI.h>
 #include <DW1000Ng.hpp>
 
 // connection pins
