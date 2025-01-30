@@ -2,7 +2,9 @@
 #include <SPI.h>
 #include <DW1000Ng.hpp>
 #include <WiFi.h>
-#include "utils.h" // Include the new header file
+#include "utils.h"
+#include <vector>
+#include <string>
 
 // CONNECTION PINS BEGIN
 #define SPI_SCK 18
@@ -18,6 +20,9 @@ const uint8_t PIN_SS = 4;   // spi select pin
 char EUI[] = "AA:BB:CC:DD:EE:FF:00:00";
 volatile uint32_t beacon_rate = 1000;
 volatile uint32_t last_beacon = 0;
+
+std::vector<String> metadataBuffer;
+unsigned long lastMetadataPrintTime = 0;
 
 device_configuration_t DEFAULT_CONFIG = {
     false,
@@ -38,19 +43,34 @@ void printCore()
   Serial.println(xPortGetCoreID());
 }
 
+void addToMetadataBuffer(const String &message)
+{
+  metadataBuffer.push_back(message);
+}
+
+void printAndClearMetadataBuffer()
+{
+  if (millis() - lastMetadataPrintTime > 1000)
+  {
+    Serial.println("[INFO]Collected Beacons:");
+    for (const auto &meta : metadataBuffer)
+    {
+      Serial.println(meta);
+    }
+    metadataBuffer.clear();
+    lastMetadataPrintTime = millis();
+  }
+}
+
 void transmitMeta()
 {
 
-  Serial.println("[BEACON]Transmitting Beacon meta");
+  // Serial.println("[BEACON]Transmitting Beacon meta");
   char message[128];
   snprintf(message, sizeof(message), "Beacon: %s | timestamp: %lu", EUI, millis());
 
   DW1000Ng::setTransmitData((uint8_t *)message, strlen(message));
   DW1000Ng::startTransmit(TransmitMode::IMMEDIATE);
-
-  Serial.println("[BEACON]Transmitting ...");
-
-  printCore();
 
   while (!DW1000Ng::isTransmitDone())
   {
@@ -63,7 +83,7 @@ void transmitMeta()
 
 void collectMeta()
 {
-  Serial.println("[INFO]Collecting meta data");
+  // Serial.println("[INFO]Collecting meta data");
 
   DW1000Ng::startReceive();
   unsigned long startTime = millis();
@@ -73,7 +93,7 @@ void collectMeta()
   {
     if (millis() - startTime > timeout)
     {
-      Serial.println("[INFO]Receive timeout");
+      // Serial.println("[INFO]Receive timeout");
       DW1000Ng::clearReceiveStatus();
       DW1000Ng::clearReceiveTimeoutStatus();
       return;
@@ -83,20 +103,20 @@ void collectMeta()
 
   String message;
   DW1000Ng::getReceivedData(message);
-  Serial.print("[INFO]Received message: ");
-  Serial.println(message);
-  Serial.print("[INFO]dBm: ");
-  Serial.println(DW1000Ng::getReceivePower());
-  Serial.print("[INFO]Quality: ");
-  Serial.println(DW1000Ng::getReceiveQuality());
+  addToMetadataBuffer(message);
 
-  byte sourceAddress[2];
-  DW1000Ng::getDeviceAddress(sourceAddress);
+  // Serial.print("[INFO]Received message: ");
+  // Serial.println(message);
+  // Serial.print("[INFO]dBm: ");
+  // Serial.println(DW1000Ng::getReceivePower());
+  // Serial.print("[INFO]Quality: ");
+  // Serial.println(DW1000Ng::getReceiveQuality());
+
+  // byte sourceAddress[2];
+  // DW1000Ng::getDeviceAddress(sourceAddress);
 
   DW1000Ng::clearReceiveStatus();
   DW1000Ng::clearReceiveTimeoutStatus();
-
-  printCore();
 }
 
 void setup()
@@ -145,10 +165,10 @@ void loop()
   if (millis() - last_beacon > beacon_rate)
   {
     transmitMeta();
-    Serial.println("[INFO]Beacon transmitted");
-  }
+    }
   else
   {
     collectMeta();
+    printAndClearMetadataBuffer();
   }
 }
