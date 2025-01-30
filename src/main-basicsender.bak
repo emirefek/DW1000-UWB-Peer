@@ -84,7 +84,7 @@ void transmit()
   delaySent = millis();
   while (!DW1000Ng::isTransmitDone())
   {
-#if defined(ESP8266)
+#if defined(ESP32)
     yield();
 #endif
   }

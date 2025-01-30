@@ -30,9 +30,13 @@ device_configuration_t DEFAULT_CONFIG = {
 
 void setup()
 {
-  // DEBUG monitoring
   Serial.begin(115200);
-  Serial.println(F("### DW1000Ng-arduino-receiver-test ###"));
+
+#if defined(ESP32)
+  Serial.println("!! ESP32 DEVICE VAR DEFINED !!");
+#endif
+
+  Serial.println(F("### DW1000Ng-ESP32-peer-communicator ###"));
   // initialize the driver
   DW1000Ng::initializeNoInterrupt(PIN_SS);
   Serial.println(F("DW1000Ng initialized ..."));
@@ -44,6 +48,7 @@ void setup()
 
   DW1000Ng::setAntennaDelay(16436);
   Serial.println(F("Committed configuration ..."));
+  
   // DEBUG chip info and registers pretty printed
   char msg[128];
   DW1000Ng::getPrintableDeviceIdentifier(msg);
