@@ -18,7 +18,7 @@ const uint8_t PIN_SS = 4;   // spi select pin
 
 // Extended Unique Identifier register. 64-bit device identifier. Register file: 0x01
 char EUI[] = "AA:BB:CC:DD:EE:FF:00:00";
-volatile uint32_t beacon_rate = 1000;
+volatile uint32_t beacon_rate = 100;
 volatile uint32_t last_beacon = 0;
 
 enum device_type
@@ -54,6 +54,15 @@ device_configuration_t DEFAULT_CONFIG = {
 
 void addToMetadataBuffer(device_type type, const String &eui, uint32_t timestamp)
 {
+  for (auto &device : metadataBuffer)
+  {
+    if (device.eui == eui)
+    {
+      device.timestamp = timestamp; // Update the timestamp if the EUI matches
+      return;
+    }
+  }
+  // If the EUI is not found, add a new entry
   DeviceInfo device = {type, eui, timestamp};
   metadataBuffer.push_back(device);
 }
@@ -102,7 +111,7 @@ void transmitMeta()
   DW1000Ng::startTransmit(TransmitMode::IMMEDIATE);
 
   unsigned long startTime = millis();
-  const unsigned long timeout = 200; // 200 ms timeout
+  const unsigned long timeout = 10; // 200 ms timeout
 
   while (!DW1000Ng::isTransmitDone())
   {
@@ -122,7 +131,7 @@ void collectMeta()
 {
   DW1000Ng::startReceive();
   unsigned long startTime = millis();
-  const unsigned long timeout = 200; // 200 ms timeout
+  const unsigned long timeout = 10; // 200 ms timeout
 
   while (!DW1000Ng::isReceiveDone())
   {
