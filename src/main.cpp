@@ -21,7 +21,22 @@ char EUI[] = "AA:BB:CC:DD:EE:FF:00:00";
 volatile uint32_t beacon_rate = 1000;
 volatile uint32_t last_beacon = 0;
 
-std::vector<String> metadataBuffer;
+enum device_type
+{
+  FORKLIFT,
+  DOOR,
+  LIFT
+};
+device_type myDeviceType = FORKLIFT;
+
+struct DeviceInfo
+{
+  device_type type;
+  String eui;
+  uint32_t timestamp;
+};
+std::vector<DeviceInfo> metadataBuffer;
+
 unsigned long lastMetadataPrintTime = 0;
 
 device_configuration_t DEFAULT_CONFIG = {
@@ -37,15 +52,10 @@ device_configuration_t DEFAULT_CONFIG = {
     PreambleLength::LEN_256,
     PreambleCode::CODE_3};
 
-void printCore()
+void addToMetadataBuffer(device_type type, const String &eui, uint32_t timestamp)
 {
-  Serial.print("Core: ");
-  Serial.println(xPortGetCoreID());
-}
-
-void addToMetadataBuffer(const String &message)
-{
-  metadataBuffer.push_back(message);
+  DeviceInfo device = {type, eui, timestamp};
+  metadataBuffer.push_back(device);
 }
 
 void printAndClearMetadataBuffer()
@@ -53,9 +63,25 @@ void printAndClearMetadataBuffer()
   if (millis() - lastMetadataPrintTime > 1000)
   {
     Serial.println("[INFO]Collected Beacons:");
-    for (const auto &meta : metadataBuffer)
+    for (const auto &device : metadataBuffer)
     {
-      Serial.println(meta);
+      Serial.print("[INFO]Device Type: ");
+      switch (device.type)
+      {
+      case FORKLIFT:
+        Serial.print("FORKLIFT");
+        break;
+      case DOOR:
+        Serial.print("DOOR");
+        break;
+      case LIFT:
+        Serial.print("LIFT");
+        break;
+      }
+      Serial.print(" | EUI: ");
+      Serial.print(device.eui);
+      Serial.print(" | Timestamp: ");
+      Serial.println(device.timestamp);
     }
     metadataBuffer.clear();
     lastMetadataPrintTime = millis();
@@ -64,16 +90,27 @@ void printAndClearMetadataBuffer()
 
 void transmitMeta()
 {
+  uint8_t message[13]; // 1 byte for device type, 8 bytes for EUI, 4 bytes for timestamp
+  uint32_t timestamp = millis();
 
-  // Serial.println("[BEACON]Transmitting Beacon meta");
-  char message[128];
-  snprintf(message, sizeof(message), "Beacon: %s | timestamp: %lu", EUI, millis());
+  // Construct the message
+  message[0] = myDeviceType;                         // 1 byte for device type
+  memcpy(&message[1], EUI, 8);                       // 8 bytes for EUI
+  memcpy(&message[9], &timestamp, sizeof(uint32_t)); // 4 bytes for timestamp
 
-  DW1000Ng::setTransmitData((uint8_t *)message, strlen(message));
+  DW1000Ng::setTransmitData(message, sizeof(message));
   DW1000Ng::startTransmit(TransmitMode::IMMEDIATE);
+
+  unsigned long startTime = millis();
+  const unsigned long timeout = 200; // 200 ms timeout
 
   while (!DW1000Ng::isTransmitDone())
   {
+    if (millis() - startTime > timeout)
+    {
+      DW1000Ng::clearTransmitStatus();
+      return;
+    }
     yield();
   }
 
@@ -83,40 +120,36 @@ void transmitMeta()
 
 void collectMeta()
 {
-  // Serial.println("[INFO]Collecting meta data");
-
   DW1000Ng::startReceive();
   unsigned long startTime = millis();
-  const unsigned long timeout = 50; // 50 ms timeout
+  const unsigned long timeout = 200; // 200 ms timeout
 
   while (!DW1000Ng::isReceiveDone())
   {
     if (millis() - startTime > timeout)
     {
-      // Serial.println("[INFO]Receive timeout");
+      // Serial.println("[ERROR]Receive timeout");
+      // DW1000Ng::reset();
       DW1000Ng::clearReceiveStatus();
+      DW1000Ng::clearReceiveFailedStatus();
       DW1000Ng::clearReceiveTimeoutStatus();
       return;
     }
     yield();
   }
 
-  String message;
-  DW1000Ng::getReceivedData(message);
-  addToMetadataBuffer(message);
-
-  // Serial.print("[INFO]Received message: ");
-  // Serial.println(message);
-  // Serial.print("[INFO]dBm: ");
-  // Serial.println(DW1000Ng::getReceivePower());
-  // Serial.print("[INFO]Quality: ");
-  // Serial.println(DW1000Ng::getReceiveQuality());
-
-  // byte sourceAddress[2];
-  // DW1000Ng::getDeviceAddress(sourceAddress);
-
   DW1000Ng::clearReceiveStatus();
-  DW1000Ng::clearReceiveTimeoutStatus();
+  uint8_t message[13];
+  DW1000Ng::getReceivedData(message, sizeof(message));
+
+  device_type type = static_cast<device_type>(message[0]);
+  char eui[9];
+  memcpy(eui, &message[1], 8);
+  eui[8] = '\0'; // Null-terminate the EUI string
+  uint32_t timestamp;
+  memcpy(&timestamp, &message[9], sizeof(uint32_t));
+
+  addToMetadataBuffer(type, String(eui), timestamp);
 }
 
 void setup()
@@ -165,7 +198,7 @@ void loop()
   if (millis() - last_beacon > beacon_rate)
   {
     transmitMeta();
-    }
+  }
   else
   {
     collectMeta();
