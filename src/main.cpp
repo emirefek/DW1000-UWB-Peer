@@ -2,14 +2,8 @@
 #include <SPI.h>
 #include <DW1000Ng.hpp>
 #include <DW1000NgUtils.hpp>
-#include <DW1000NgConstants.hpp>
-#include <DW1000NgRanging.hpp>
-#include <DW1000NgTime.hpp>
-#include <DW1000NgTime.hpp>
-#include <DW1000NgUtils.hpp>
-
-#include "utils.h"
-#include "ranging.h"
+#include <ranging.h>
+#include <utils.h>
 #include <vector>
 #include <string>
 #include <cstring>
@@ -24,7 +18,7 @@ const uint8_t PIN_IRQ = 34; // irq pin
 const uint8_t PIN_SS = 4;   // spi select pin
 // CONNECTION PINS END
 
-// Extended Unique Identifier register. 64-bit device identifier. Register file: 0x01
+// Extended Unique Identifier register. 64-bit device identifier.
 char EUID[] = "AA:BB:CC:DD:EE:FF:00:00";
 
 enum CarrierType
@@ -45,7 +39,8 @@ struct BlinkWave
 {
   WaveType type = WaveType::BLINK;
   String euid;
-  uint32_t t1;
+  // t1 is now not sent over the air, only stored locally.
+  uint32_t blinkHash; // Random hash for this blink
   CarrierType carrier;
 };
 
@@ -54,10 +49,11 @@ struct AnswerWave
   WaveType type = WaveType::ANSWER;
   String euid;
   String initiator_euid;
-  uint32_t t1;
-  uint32_t t2;
-  uint32_t t3;
-  uint32_t taxi_time;
+  // t1 removed from answer message.
+  uint64_t t2;        // ANSWER reception timestamp (raw DW1000 value)
+  uint64_t t3;        // ANSWER transmission timestamp (raw DW1000 value)
+  uint64_t taxi_time; // Processing delay (t3 - t2) in raw DW1000 units
+  uint32_t blinkHash; // Echoed blink hash from the original blink
   CarrierType carrier;
 };
 
@@ -91,7 +87,7 @@ struct WaveMessage
   // Default constructor
   WaveMessage() : type(WaveType::BLINK), blink() {}
 
-  // Destructor - Needed for union
+  // Destructor - Required for union usage.
   ~WaveMessage() {}
 };
 
@@ -99,7 +95,7 @@ struct NeighborEntry
 {
   String euid;             // Unique identifier of the neighbor
   float lastDistance;      // Last calculated distance (or other metric)
-  uint32_t lastUpdateTime; // Timestamp of the last received message
+  uint32_t lastUpdateTime; // Timestamp of the last received message (using millis() for display)
   int signalQuality;       // Optional quality/signal metric
 };
 
@@ -107,9 +103,12 @@ struct NeighborEntry
 std::vector<NeighborEntry> neighborTable;
 
 uint32_t lastNeighborTablePrint = 0;
-
 const uint16_t blinkRate = 300;
 uint32_t lastBlinkTime = 0;
+
+// Global storage for the last BLINK event (local t1 stored but not sent)
+uint64_t lastBlinkT1 = 0;
+uint32_t lastBlinkHash = 0;
 
 device_configuration_t DEFAULT_CONFIG = {
     false,
@@ -125,67 +124,67 @@ device_configuration_t DEFAULT_CONFIG = {
     PreambleCode::CODE_3};
 
 void transmitWaveMessage(const WaveMessage &message);
-void receiveWaveMessage(WaveMessage &message, uint32_t &recieveTimestamp);
+void receiveWaveMessage(WaveMessage &message, uint64_t &receiveTimestamp);
 void serializeWaveMessage(const WaveMessage &message, uint8_t *buffer, size_t &length);
 void deserializeWaveMessage(const uint8_t *buffer, size_t length, WaveMessage &message);
 void updateNeighborTable(const String &euid, float distance, int quality);
 void printNeighborTable();
 void recieveMode();
 
+// Forward declaration of calculateDistance from ranging.cpp
+double calculateDistance(uint64_t t1, uint64_t t4, uint64_t T_taxi);
+
 void setup()
 {
   Serial.begin(115200);
-
 #if defined(ESP32)
   Serial.println("!! ESP32 DEVICE VAR DEFINED !!");
 #endif
 
   generateUniqueId(EUID);
-  Serial.print("[INFO]Unique Device ID: ");
+  Serial.print("[INFO] Unique Device ID: ");
   Serial.println(EUID);
 
   Serial.println(F("### DW1000Ng-ESP32-peer-communicator ###"));
-  // initialize the driver
   DW1000Ng::initializeNoInterrupt(PIN_SS);
   Serial.println(F("DW1000Ng initialized ..."));
 
   DW1000Ng::applyConfiguration(DEFAULT_CONFIG);
-
   DW1000Ng::setEUI(EUID);
-
   DW1000Ng::setDeviceAddress(6);
   DW1000Ng::setNetworkId(10);
-
   DW1000Ng::setAntennaDelay(16436);
   Serial.println(F("Committed configuration ..."));
 
-  // DEBUG chip info and registers pretty printed
   char msg[128];
   DW1000Ng::getPrintableDeviceIdentifier(msg);
-  Serial.print("[INFO]Device ID: ");
+  Serial.print("[INFO] Device ID: ");
   Serial.println(msg);
   DW1000Ng::getPrintableExtendedUniqueIdentifier(msg);
-  Serial.print("[INFO]Unique ID: ");
+  Serial.print("[INFO] Unique ID: ");
   Serial.println(msg);
   DW1000Ng::getPrintableNetworkIdAndShortAddress(msg);
-  Serial.print("[INFO]Network ID & Device Address: ");
+  Serial.print("[INFO] Network ID & Device Address: ");
   Serial.println(msg);
   DW1000Ng::getPrintableDeviceMode(msg);
-  Serial.print("[INFO]Device mode: ");
+  Serial.print("[INFO] Device mode: ");
   Serial.println(msg);
 }
 
 void loop()
 {
-  // Blink every 300ms
+  // Send a BLINK every blinkRate milliseconds
   if (millis() - lastBlinkTime > blinkRate)
   {
     lastBlinkTime = millis();
     BlinkWave bw;
     bw.euid = EUID;
-    bw.t1 = DW1000Ng::getSystemTimestamp();
+    lastBlinkT1 = DW1000Ng::getSystemTimestamp();   // Capture t1 locally (DW1000 raw system timestamp)
+    bw.blinkHash = static_cast<uint32_t>(random()); // Generate a random hash for this BLINK
+    lastBlinkHash = bw.blinkHash;
     bw.carrier = thisCarrierType;
 
+    // Note: Do not transmit t1 over protocol.
     WaveMessage message(bw);
     transmitWaveMessage(message);
   }
@@ -202,8 +201,7 @@ void loop()
 void recieveMode()
 {
   WaveMessage message;
-  uint32_t receiveTimestamp;
-
+  uint64_t receiveTimestamp;
   receiveWaveMessage(message, receiveTimestamp);
 
   switch (message.type)
@@ -211,25 +209,20 @@ void recieveMode()
   case WaveType::BLINK:
   {
     if (message.blink.euid == "")
-    {
       break;
-    }
-    {
-      AnswerWave aw;
-      aw.euid = EUID;
-      aw.initiator_euid = message.blink.euid;
-      aw.t1 = message.blink.t1;               // already from DW1000
-      aw.t2 = receiveTimestamp;               // from DW1000Ng::getReceiveTimestamp()
-      aw.t3 = DW1000Ng::getSystemTimestamp(); // now from DW1000 (not micros())
-      aw.taxi_time = aw.t3 - aw.t2;           // in DW1000 raw units
-      aw.carrier = thisCarrierType;
+    // Respond to BLINK with an ANSWER containing the blinkHash.
+    AnswerWave aw;
+    aw.euid = EUID;
+    aw.initiator_euid = message.blink.euid;
+    // Do not copy t1 from blink, since blinker already stored it.
+    aw.t2 = receiveTimestamp;               // ANSWER reception timestamp
+    aw.t3 = DW1000Ng::getSystemTimestamp(); // ANSWER transmission timestamp
+    aw.taxi_time = aw.t3 - aw.t2;           // Processing delay in raw DW1000 units
+    aw.blinkHash = message.blink.blinkHash; // Echo the blink hash
+    aw.carrier = thisCarrierType;
 
-      // Serial.printf("Blink received: t1: %u, t2: %u, t3: %u, receiveTimestamp: %u\n", aw.t1, aw.t2, aw.t3, receiveTimestamp);
-
-      WaveMessage response(aw);
-      transmitWaveMessage(response);
-    }
-
+    WaveMessage response(aw);
+    transmitWaveMessage(response);
     break;
   }
 
@@ -240,18 +233,17 @@ void recieveMode()
       Serial.printf("ANSWER DITCHED EUID: %s\n", message.answer.euid.c_str());
       break;
     }
-
-    // Now all times are assumed to be in microseconds:
-    uint64_t t1 = message.answer.t1;            // transmit time of Blink (in µs)
-    uint64_t t4 = receiveTimestamp;             // receive time of Answer (in µs)
-    uint64_t T_taxi = message.answer.taxi_time; // processing time in µs
-
-    // Serial.printf("Answer received: t1: %llu, t2: %u, t3: %u, t4: %llu, T_taxi: %llu\n",
-    //               t1, message.answer.t2, message.answer.t3, t4, T_taxi);
+    if (message.answer.blinkHash != lastBlinkHash)
+    {
+      Serial.println("Received ANSWER for a different BLINK; discarding.");
+      break;
+    }
+    // Use the stored BLINK t1 with ANSWER timestamps to calculate distance.
+    uint64_t t1 = lastBlinkT1;
+    uint64_t t4 = receiveTimestamp; // ANSWER reception timestamp at blinker
+    uint64_t T_taxi = message.answer.taxi_time;
 
     double distance = calculateDistance(t1, t4, T_taxi);
-    // Serial.printf("Calculated distance: %f\n", distance);
-
     updateNeighborTable(message.answer.euid, distance, 0);
     break;
   }
@@ -275,7 +267,6 @@ void transmitWaveMessage(const WaveMessage &message)
 
   unsigned long startTime = millis();
   const unsigned long timeout = 10;
-
   while (!DW1000Ng::isTransmitDone())
   {
     if (millis() - startTime > timeout)
@@ -285,16 +276,14 @@ void transmitWaveMessage(const WaveMessage &message)
     }
     yield();
   }
-
   DW1000Ng::clearTransmitStatus();
-};
+}
 
-void receiveWaveMessage(WaveMessage &message, uint32_t &recieveTimestamp)
+void receiveWaveMessage(WaveMessage &message, uint64_t &receiveTimestamp)
 {
   DW1000Ng::startReceive();
   unsigned long startTime = millis();
   const unsigned long timeout = 100;
-
   while (!DW1000Ng::isReceiveDone())
   {
     if (millis() - startTime > timeout)
@@ -306,53 +295,45 @@ void receiveWaveMessage(WaveMessage &message, uint32_t &recieveTimestamp)
     }
     yield();
   }
-
   DW1000Ng::clearReceiveStatus();
   uint8_t buffer[128];
   DW1000Ng::getReceivedData(buffer, sizeof(buffer));
-
-  recieveTimestamp = DW1000Ng::getReceiveTimestamp();
-
+  receiveTimestamp = DW1000Ng::getReceiveTimestamp(); // DW1000 raw timestamp for reception
   size_t length = sizeof(buffer);
   deserializeWaveMessage(buffer, length, message);
 }
 
-// Serialize WaveMessage to byte array
 void serializeWaveMessage(const WaveMessage &message, uint8_t *buffer, size_t &length)
 {
   buffer[0] = static_cast<uint8_t>(message.type);
   size_t offset = 1;
-
   switch (message.type)
   {
   case WaveType::BLINK:
-    // Serialize BlinkWave: euid, t1, carrier
-    memcpy(buffer + offset, message.blink.euid.c_str(), message.blink.euid.length() + 1); // include null terminator
+    memcpy(buffer + offset, message.blink.euid.c_str(), message.blink.euid.length() + 1);
     offset += message.blink.euid.length() + 1;
-    memcpy(buffer + offset, &message.blink.t1, sizeof(message.blink.t1));
-    offset += sizeof(message.blink.t1);
+    // Do not send t1.
+    memcpy(buffer + offset, &message.blink.blinkHash, sizeof(message.blink.blinkHash));
+    offset += sizeof(message.blink.blinkHash);
     buffer[offset++] = static_cast<uint8_t>(message.blink.carrier);
     break;
-
   case WaveType::ANSWER:
-    // Serialize AnswerWave: euid, initiator_euid, t1, t2, t3, taxi_time, carrier
     memcpy(buffer + offset, message.answer.euid.c_str(), message.answer.euid.length() + 1);
     offset += message.answer.euid.length() + 1;
     memcpy(buffer + offset, message.answer.initiator_euid.c_str(), message.answer.initiator_euid.length() + 1);
     offset += message.answer.initiator_euid.length() + 1;
-    memcpy(buffer + offset, &message.answer.t1, sizeof(message.answer.t1));
-    offset += sizeof(message.answer.t1);
+    // Do not send t1.
     memcpy(buffer + offset, &message.answer.t2, sizeof(message.answer.t2));
     offset += sizeof(message.answer.t2);
     memcpy(buffer + offset, &message.answer.t3, sizeof(message.answer.t3));
     offset += sizeof(message.answer.t3);
     memcpy(buffer + offset, &message.answer.taxi_time, sizeof(message.answer.taxi_time));
     offset += sizeof(message.answer.taxi_time);
+    memcpy(buffer + offset, &message.answer.blinkHash, sizeof(message.answer.blinkHash));
+    offset += sizeof(message.answer.blinkHash);
     buffer[offset++] = static_cast<uint8_t>(message.answer.carrier);
     break;
-
   case WaveType::RESULT:
-    // Serialize ResultWave: initiator_euid, responder_euid, calculated_distance
     memcpy(buffer + offset, message.result.initiator_euid.c_str(), message.result.initiator_euid.length() + 1);
     offset += message.result.initiator_euid.length() + 1;
     memcpy(buffer + offset, message.result.responder_euid.c_str(), message.result.responder_euid.length() + 1);
@@ -368,35 +349,34 @@ void deserializeWaveMessage(const uint8_t *buffer, size_t length, WaveMessage &m
 {
   message.type = static_cast<WaveType>(buffer[0]);
   size_t offset = 1;
-
   switch (message.type)
   {
   case WaveType::BLINK:
-    new (&message.blink) BlinkWave(); // placement new to properly reinitialize union member
+    new (&message.blink) BlinkWave();
     message.blink.euid = String((char *)(buffer + offset));
     offset += message.blink.euid.length() + 1;
-    memcpy(&message.blink.t1, buffer + offset, sizeof(message.blink.t1));
-    offset += sizeof(message.blink.t1);
+    // Do not receive t1.
+    memcpy(&message.blink.blinkHash, buffer + offset, sizeof(message.blink.blinkHash));
+    offset += sizeof(message.blink.blinkHash);
     message.blink.carrier = static_cast<CarrierType>(buffer[offset++]);
     break;
-
   case WaveType::ANSWER:
     new (&message.answer) AnswerWave();
     message.answer.euid = String((char *)(buffer + offset));
     offset += message.answer.euid.length() + 1;
     message.answer.initiator_euid = String((char *)(buffer + offset));
     offset += message.answer.initiator_euid.length() + 1;
-    memcpy(&message.answer.t1, buffer + offset, sizeof(message.answer.t1));
-    offset += sizeof(message.answer.t1);
+    // Do not receive t1.
     memcpy(&message.answer.t2, buffer + offset, sizeof(message.answer.t2));
     offset += sizeof(message.answer.t2);
     memcpy(&message.answer.t3, buffer + offset, sizeof(message.answer.t3));
     offset += sizeof(message.answer.t3);
     memcpy(&message.answer.taxi_time, buffer + offset, sizeof(message.answer.taxi_time));
     offset += sizeof(message.answer.taxi_time);
+    memcpy(&message.answer.blinkHash, buffer + offset, sizeof(message.answer.blinkHash));
+    offset += sizeof(message.answer.blinkHash);
     message.answer.carrier = static_cast<CarrierType>(buffer[offset++]);
     break;
-
   case WaveType::RESULT:
     new (&message.result) ResultWave();
     message.result.initiator_euid = String((char *)(buffer + offset));
@@ -412,7 +392,6 @@ void deserializeWaveMessage(const uint8_t *buffer, size_t length, WaveMessage &m
 void updateNeighborTable(const String &euid, float distance, int quality)
 {
   uint32_t now = millis();
-  // Search for an existing entry with the same EUID
   for (auto &neighbor : neighborTable)
   {
     if (neighbor.euid == euid)
@@ -420,11 +399,9 @@ void updateNeighborTable(const String &euid, float distance, int quality)
       neighbor.lastDistance = distance;
       neighbor.lastUpdateTime = now;
       neighbor.signalQuality = quality;
-      return; // Entry updated, exit
+      return;
     }
   }
-
-  // If not found, add a new entry
   NeighborEntry newNeighbor;
   newNeighbor.euid = euid;
   newNeighbor.lastDistance = distance;
@@ -433,7 +410,6 @@ void updateNeighborTable(const String &euid, float distance, int quality)
   neighborTable.push_back(newNeighbor);
 }
 
-// Function to print the neighbor table
 void printNeighborTable()
 {
   Serial.println("[INFO] Neighbor Table:");
@@ -442,7 +418,7 @@ void printNeighborTable()
     Serial.print("EUID: ");
     Serial.print(neighbor.euid);
     Serial.print(" | Last Distance: ");
-    Serial.print(neighbor.lastDistance, 2); // Print float with 2 decimal places
+    Serial.print(neighbor.lastDistance, 2);
     Serial.print(" | Last Update: ");
     Serial.print(neighbor.lastUpdateTime);
     Serial.print(" | Signal Quality: ");
